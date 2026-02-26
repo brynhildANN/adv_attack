@@ -397,7 +397,8 @@ def main():
         cfg=cfg, job_id=job_id, task=task, model=model, datasets=datasets
     )
 
-    output_dir = os.path.join(cfg.run_cfg["output_dir"], args.image_path[args.image_path.rfind("/") + 1:])
+    # Make output directory name robust on Windows/Linux paths
+    output_dir = os.path.join(cfg.run_cfg["output_dir"], os.path.basename(os.path.normpath(args.image_path)))
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     registry.mapping["paths"]["output_dir"] = output_dir
