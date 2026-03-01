@@ -1,72 +1,63 @@
+"""
+图像描述 (Image Captioning) 评估脚本
+"""
+from __future__ import annotations
+
 import os
+# 设置 HuggingFace 镜像，必须在导入 transformers/lavis 之前设置
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
 import argparse
+import json
 import random
-import re
+import warnings
+from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
+from omegaconf import OmegaConf
+from torchvision import transforms
+from torchvision.transforms.functional import InterpolationMode
 
+import lavis.common.utils as utils
 import lavis.tasks as tasks
 from lavis.common.config import Config
 from lavis.common.dist_utils import get_rank, init_distributed_mode
 from lavis.common.logger import setup_logger
-from lavis.common.optims import (
-    LinearWarmupCosineLRScheduler,
-    LinearWarmupStepLRScheduler,
-)
-from lavis.common.utils import now
-
-# imports modules for registration
-from lavis.datasets.builders import *
-from lavis.models import *
-from lavis.processors import *
-from lavis.runners.runner_base import RunnerBase
-from lavis.tasks import *
 from lavis.common.registry import registry
-
+from lavis.common.utils import now
 from lavis.datasets.datasets.caption_datasets import CaptionDataset
-from lavis.datasets.datasets.coco_caption_datasets import COCOCapEvalDataset
+from lavis.datasets.datasets.coco_caption_datasets import COCOCapEvalDataset, NoCapsEvalDataset
 from lavis.processors.blip_processors import BlipImageBaseProcessor
-from omegaconf import OmegaConf
-from torchvision import transforms
-from torchvision.transforms.functional import InterpolationMode
 from lavis.processors.clip_processors import _convert_to_rgb
-import lavis.common.utils as utils
-import warnings
 from lavis.processors.randaugment import RandomAugment
-from lavis.datasets.datasets.coco_caption_datasets import NoCapsEvalDataset
+from lavis.runners.runner_base import RunnerBase
 from lavis_tool.caption import CaptionTask
-# from lavis.tasks.captioning import CaptionTask
-
-# from lavis.processors.blip_processors import BlipCaptionProcessor
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Training")
+def parse_args() -> argparse.Namespace:
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description="Image Captioning Evaluation")
 
-    parser.add_argument("--cfg_path", help="path to configuration file.")
-    parser.add_argument("--cache_path",  help="path to dataset cache")
-    parser.add_argument("--json_path",help="test data path")
-    parser.add_argument("--gt_path", help="path to groung truth")
-    parser.add_argument("--image_path", help="path to image dataset")
-    parser.add_argument("--output_dir", help="path where to save result")
+    parser.add_argument("--cfg_path", help="配置文件路径")
+    parser.add_argument("--cache_path", help="数据集缓存路径")
+    parser.add_argument("--json_path", help="测试数据路径 (json)")
+    parser.add_argument("--gt_path", help="真值路径 (ground truth)")
+    parser.add_argument("--image_path", help="图片数据集路径")
+    parser.add_argument("--output_dir", help="结果保存路径")
 
     parser.add_argument(
         "--options",
         nargs="+",
-        help="override some settings in the used config, the key-value pair "
-             "in xxx=yyy format will be merged into config file (deprecate), "
-             "change to --cfg-options instead.",
+        help="覆盖配置文件中的部分设置，格式为 key=value",
     )
     args = parser.parse_args()
-    # if 'LOCAL_RANK' not in os.environ:
-    #     os.environ['LOCAL_RANK'] = str(args.local_rank)
-
     return args
 
 
-def setup_seeds(config):
+def setup_seeds(config: Config) -> None:
+    """设置随机种子以保证可复现性"""
     seed = config.run_cfg.seed + get_rank()
 
     random.seed(seed)
@@ -78,8 +69,15 @@ def setup_seeds(config):
 
 
 class BlipImageTrainProcessor(BlipImageBaseProcessor):
+    """BLIP 图像训练预处理器"""
     def __init__(
-            self, image_size=384, transform=None, mean=None, std=None, min_scale=0.5, max_scale=1.0
+        self, 
+        image_size: int = 384, 
+        transform: Optional[transforms.Compose] = None, 
+        mean: Optional[Tuple[float]] = None, 
+        std: Optional[Tuple[float]] = None, 
+        min_scale: float = 0.5, 
+        max_scale: float = 1.0
     ):
         super().__init__(mean=mean, std=std)
         if transform is None:
@@ -124,10 +122,8 @@ class BlipImageTrainProcessor(BlipImageBaseProcessor):
             cfg = OmegaConf.create()
 
         image_size = cfg.get("image_size", 384)
-
         mean = cfg.get("mean", None)
         std = cfg.get("std", None)
-
         min_scale = cfg.get("min_scale", 0.5)
         max_scale = cfg.get("max_scale", 1.0)
 
@@ -141,7 +137,14 @@ class BlipImageTrainProcessor(BlipImageBaseProcessor):
 
 
 class BlipImageEvalProcessor(BlipImageBaseProcessor):
-    def __init__(self, image_size=384, transform=None, mean=None, std=None):
+    """BLIP 图像评估预处理器"""
+    def __init__(
+        self, 
+        image_size: int = 384, 
+        transform: Optional[transforms.Compose] = None, 
+        mean: Optional[Tuple[float]] = None, 
+        std: Optional[Tuple[float]] = None
+    ):
         super().__init__(mean=mean, std=std)
         if transform is None:
             self.transform = transforms.Compose(
@@ -165,7 +168,6 @@ class BlipImageEvalProcessor(BlipImageBaseProcessor):
             cfg = OmegaConf.create()
 
         image_size = cfg.get("image_size", 384)
-
         mean = cfg.get("mean", None)
         std = cfg.get("std", None)
 
@@ -173,8 +175,15 @@ class BlipImageEvalProcessor(BlipImageBaseProcessor):
 
 
 class ClipImageTrainProcessor(BlipImageBaseProcessor):
+    """CLIP 图像训练预处理器"""
     def __init__(
-            self, image_size=224, transform=None, mean=None, std=None, min_scale=0.9, max_scale=1.0
+        self, 
+        image_size: int = 224, 
+        transform: Optional[transforms.Compose] = None, 
+        mean: Optional[Tuple[float]] = None, 
+        std: Optional[Tuple[float]] = None, 
+        min_scale: float = 0.9, 
+        max_scale: float = 1.0
     ):
         super().__init__(mean=mean, std=std)
         if transform is None:
@@ -199,10 +208,8 @@ class ClipImageTrainProcessor(BlipImageBaseProcessor):
             cfg = OmegaConf.create()
 
         image_size = cfg.get("image_size", 224)
-
         mean = cfg.get("mean", None)
         std = cfg.get("std", None)
-
         min_scale = cfg.get("min_scale", 0.9)
         max_scale = cfg.get("max_scale", 1.0)
 
@@ -216,7 +223,14 @@ class ClipImageTrainProcessor(BlipImageBaseProcessor):
 
 
 class ClipImageEvalProcessor(BlipImageBaseProcessor):
-    def __init__(self, image_size=224, transform=None, mean=None, std=None):
+    """CLIP 图像评估预处理器"""
+    def __init__(
+        self, 
+        image_size: int = 224, 
+        transform: Optional[transforms.Compose] = None, 
+        mean: Optional[Tuple[float]] = None, 
+        std: Optional[Tuple[float]] = None
+    ):
         super().__init__(mean=mean, std=std)
         if transform is None:
             self.transform = transforms.Compose(
@@ -237,7 +251,6 @@ class ClipImageEvalProcessor(BlipImageBaseProcessor):
             cfg = OmegaConf.create()
 
         image_size = cfg.get("image_size", 224)
-
         mean = cfg.get("mean", None)
         std = cfg.get("std", None)
 
@@ -248,39 +261,34 @@ class ClipImageEvalProcessor(BlipImageBaseProcessor):
         )
 
 
-def _build_proc_from_cfg(cfg):
-    return (
-        registry.get_processor_class(cfg.name).from_config(cfg)
-        if cfg is not None
-        else None
-    )
-
-
-def build(cfg, transform=None):
+def build(cfg: Config, transform: Optional[transforms.Compose] = None) -> Dict:
     """
-    Create by split datasets inheriting torch.utils.data.Datasets.
-
-    # build() can be dataset-specific. Overwrite to customize.
+    构建数据集
+    覆盖默认的 build 方法以支持自定义 transform 和路径
     """
     try:
         image_size = cfg.config['preprocess']['vis_processor']['eval']['image_size']
-    except:
+    except Exception:
         image_size = 384
 
     config = cfg.config['datasets']
-    # self.build_processors()
-    text_processor_dict = {'name': 'blip_caption'}
-
-    vis_processors = {'train': BlipImageTrainProcessor(image_size=image_size, transform=transform),
-                      'eval': BlipImageEvalProcessor(image_size=image_size, transform=transform)}
-    text_processors = {'train': registry.get_processor_class('blip_caption').from_config({'name': 'blip_caption'}),
-                       'eval': registry.get_processor_class('blip_caption').from_config({'name': 'blip_caption'})}
+    
+    # 定义处理器
+    vis_processors = {
+        'train': BlipImageTrainProcessor(image_size=image_size, transform=transform),
+        'eval': BlipImageEvalProcessor(image_size=image_size, transform=transform)
+    }
+    text_processors = {
+        'train': registry.get_processor_class('blip_caption').from_config({'name': 'blip_caption'}),
+        'eval': registry.get_processor_class('blip_caption').from_config({'name': 'blip_caption'})
+    }
+    
     retrieval_datasets_keys = list(config.keys())
-    build_info = config[retrieval_datasets_keys[0]]['build_info']
-    # build_info = config.build_info
+    dataset_key = retrieval_datasets_keys[0]
+    build_info = config[dataset_key]['build_info']
 
     ann_info = build_info['annotations']
-    data_type = config[retrieval_datasets_keys[0]]['data_type']
+    data_type = config[dataset_key]['data_type']
     vis_info = build_info[data_type]
 
     datasets = dict()
@@ -290,18 +298,11 @@ def build(cfg, transform=None):
 
         is_train = split == "train"
 
-        # processors
-        vis_processor = (
-            vis_processors["train"]
-            if is_train
-            else vis_processors["eval"]
-        )
-        text_processor = (
-            text_processors["train"]
-            if is_train
-            else text_processors["eval"]
-        )
-        # annotation path
+        # 选择处理器
+        vis_processor = vis_processors["train"] if is_train else vis_processors["eval"]
+        text_processor = text_processors["train"] if is_train else text_processors["eval"]
+        
+        # 处理标注路径
         ann_paths = ann_info.get(split).storage
         if isinstance(ann_paths, str):
             ann_paths = [ann_paths]
@@ -312,99 +313,160 @@ def build(cfg, transform=None):
                 ann_path = utils.get_cache_path(ann_path)
             abs_ann_paths.append(ann_path)
         ann_paths = abs_ann_paths
+        
+        # 检查标注文件是否存在
+        if not os.path.exists(ann_paths[0]):
+             warnings.warn(f"标注路径 {ann_paths[0]} 不存在。跳过 {split} 分割。")
+             continue
 
-        # visual data storage path
+        # 处理图像存储路径
         vis_path = vis_info.storage
-
         if not os.path.isabs(vis_path):
-            # vis_path = os.path.join(utils.get_cache_path(), vis_path)
             vis_path = utils.get_cache_path(vis_path)
 
         if not os.path.exists(vis_path):
-            warnings.warn("storage path {} does not exist.".format(vis_path))
+            warnings.warn(f"存储路径 {vis_path} 不存在。")
 
-        # create datasets
-        if retrieval_datasets_keys[0]=="nocaps":
+        # 创建数据集实例
+        if dataset_key == "nocaps":
             dataset_cls = NoCapsEvalDataset
         else:
             dataset_cls = CaptionDataset if is_train else COCOCapEvalDataset
+            
         datasets[split] = dataset_cls(
             vis_processor=vis_processor,
             text_processor=text_processor,
             ann_paths=ann_paths,
             vis_root=vis_path,
         )
-    datasets_retrieval = {retrieval_datasets_keys[0]: datasets}
+        
+    datasets_retrieval = {dataset_key: datasets}
     return datasets_retrieval
 
 
-
 def main():
-    # allow auto-dl completes on main process without timeout when using NCCL backend.
-    # os.environ["NCCL_BLOCKING_WAIT"] = "1"
-
-    # set before init_distributed_mode() to ensure the same job_id shared across all ranks.
+    print("[进度] 开始图像描述任务...")
+    
     args = parse_args()
-    registry.mapping["paths"]["cache_root"] = args.cache_path
+    print("[进度] 正在加载配置...")
+    
+    # 强制将缓存根目录设置为本地目录，避免权限问题和全局缓存损坏
+    local_cache_root = args.cache_path if args.cache_path else os.path.join(os.getcwd(), "cache")
+    os.makedirs(local_cache_root, exist_ok=True)
+    
+    # 更新 registry 路径
+    registry.mapping["paths"]["cache_root"] = local_cache_root
+    
+    # 同时设置 torch hub 目录，确保 checkpoint 下载到此处
+    torch.hub.set_dir(local_cache_root)
+    
     job_id = now()
-
     cfg = Config(args)
-    registry.mapping["paths"]["coco_gt"]=""
+    registry.mapping["paths"]["coco_gt"] = ""
+    
+    # 获取数据集名称
+    dataset_name = list(cfg.config['datasets'].keys())[0]
+
+    # 根据命令行参数更新配置
     if args.image_path:
-        cfg.config['datasets'][list(cfg.config['datasets'].keys())[0]]['build_info']['images'][
-            'storage'] = args.image_path
+        cfg.config['datasets'][dataset_name]['build_info']['images']['storage'] = args.image_path
     if args.output_dir:
         cfg.config['run']['output_dir'] = args.output_dir
     if args.json_path:
-        dataset_name = list(cfg.config['datasets'].keys())[0]
         cfg.config['datasets'][dataset_name]['build_info']['annotations']['test']['storage'] = args.json_path
     if args.gt_path:
-        registry.mapping["paths"]["coco_gt"]=args.gt_path
+        registry.mapping["paths"]["coco_gt"] = args.gt_path
+        
+    # 动态过滤 JSON 数据集 (如果提供了 image_path 和 json_path)
+    if args.image_path and args.json_path:
+        print(f"[检查] 正在检查图像是否存在于 {args.image_path}...")
+        try:
+            # 只有当 json_path 确实存在时才尝试读取
+            if os.path.exists(args.json_path):
+                with open(args.json_path, 'r') as f:
+                    data = json.load(f)
+                
+                if os.path.exists(args.image_path):
+                    available_images = set(os.listdir(args.image_path))
+                    # 注意：Caption 数据集的 JSON 格式可能略有不同，通常是列表，每个元素包含 'image' 字段
+                    # 如果格式不同，可能需要调整。这里假设是标准的 [{"image": "xxx.jpg", ...}, ...] 列表
+                    filtered_data = [item for item in data if isinstance(item, dict) and item.get('image') in available_images]
+                    
+                    if len(filtered_data) < len(data):
+                        print(f"[警告] 过滤数据集: 从 {len(data)} 条记录过滤到 {len(filtered_data)} 条，基于可用图像。")
+                        
+                        # 创建临时过滤后的 JSON 文件
+                        output_dir = args.output_dir if args.output_dir else "output"
+                        if not os.path.exists(output_dir):
+                            os.makedirs(output_dir, exist_ok=True)
+                        
+                        temp_json_path = os.path.join(output_dir, f"temp_filtered_{os.path.basename(args.json_path)}")
+                        with open(temp_json_path, 'w') as f:
+                            json.dump(filtered_data, f, indent=4)
+                        
+                        # 更新配置以使用过滤后的 JSON
+                        cfg.config['datasets'][dataset_name]['build_info']['annotations']['test']['storage'] = temp_json_path
+                        print(f"[信息] 使用过滤后的数据集: {temp_json_path}")
+                    else:
+                        print("[信息] 数据集中的所有图像都已找到。")
+                else:
+                     print(f"[错误] 图像路径 {args.image_path} 不存在。")
+            else:
+                print(f"[警告] JSON 路径 {args.json_path} 不存在，跳过过滤。")
+
+        except Exception as e:
+            print(f"[警告] 过滤数据集失败: {e}")
+            # 不中断程序，继续尝试运行
+
     init_distributed_mode(cfg.run_cfg)
-
     setup_seeds(cfg)
-
-    # set after init_distributed_mode() to only log on master.
     setup_logger()
 
-    cfg.pretty_print()
-    if cfg.config['datasets']=="nocaps":
+    print("[进度] 正在设置任务...")
+    # cfg.pretty_print()
+    
+    if cfg.config['datasets'] == "nocaps":
         task = tasks.setup_task(cfg)
     else:
         task = CaptionTask.setup_task(cfg=cfg)
 
     try:
         image_size = cfg.config['preprocess']['vis_processor']['eval']['image_size']
-    except:
+    except Exception:
         image_size = 384
-    normalize = transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711))
-    transform = transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            _convert_to_rgb,
-            transforms.ToTensor(),
-            normalize
-        ]
+        
+    normalize = transforms.Normalize(
+        (0.48145466, 0.4578275, 0.40821073), 
+        (0.26862954, 0.26130258, 0.27577711)
     )
+    transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        _convert_to_rgb,
+        transforms.ToTensor(),
+        normalize
+    ])
+    
+    print("[进度] 正在构建数据集...")
     datasets = build(cfg, transform=transform)
-    # datasets = build(cfg, transform=None)
-    # datasets = task.build_datasets(cfg)
 
-
+    print("[进度] 正在构建模型...")
     model = task.build_model(cfg)
 
     runner = RunnerBase(
         cfg=cfg, job_id=job_id, task=task, model=model, datasets=datasets
     )
 
-    # Make output directory name robust on Windows/Linux paths
-    output_dir = os.path.join(cfg.run_cfg["output_dir"], os.path.basename(os.path.normpath(args.image_path)))
+    # 确保输出目录名称在不同系统下兼容
+    output_dir = os.path.join(cfg.run_cfg["output_dir"], os.path.basename(os.path.normpath(args.image_path)) if args.image_path else job_id)
     if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
     registry.mapping["paths"]["output_dir"] = output_dir
     registry.mapping["paths"]["result_dir"] = output_dir
 
+    print("[进度] 开始评估...")
     runner.evaluate(skip_reload=True)
+    print("[进度] 评估完成。")
+
 
 if __name__ == "__main__":
     main()

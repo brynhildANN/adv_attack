@@ -1,4 +1,5 @@
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -78,6 +79,20 @@ def make_dataloader(args, batch_size, rank, world_size):
         transforms.ToTensor(),
     ])
 
+    # Check if image directories exist (basic check for COCO 2014 structure expected by Karpathy split)
+    # Note: Karpathy split uses images from both train2014 and val2014
+    train2014_path = os.path.join(args.data_dir, "train2014")
+    val2014_path = os.path.join(args.data_dir, "val2014")
+    
+    if not os.path.exists(train2014_path) and not os.path.exists(val2014_path):
+        if rank == 0:
+            print(f"\n{'='*50}")
+            print(f"WARNING: COCO image directories not found in {args.data_dir}")
+            print(f"Expected: {train2014_path} and/or {val2014_path}")
+            print("LAVIS requires local images for COCO Retrieval dataset.")
+            print("Please download COCO 2014 train/val images and extract them here.")
+            print(f"{'='*50}\n")
+    
     coco_dataset = load_dataset(args.dataset, vis_path=args.data_dir)
     train_dataset = coco_dataset['train']
 
@@ -86,13 +101,12 @@ def make_dataloader(args, batch_size, rank, world_size):
     train_data_loader = DataLoader(train_dataset, batch_size=batch_size, num_workers=4, pin_memory=True, shuffle=False,
                                    sampler=train_sampler, collate_fn=train_collate_fn, drop_last=True)
 
-    imagenet_dataset = torchvision.datasets.ImageFolder(args.imagenet, transform=transform)
-    imagenet_sampler = torch.utils.data.distributed.DistributedSampler(imagenet_dataset, num_replicas=world_size,
-                                                                       rank=rank)
+    if rank == 0:
+        print(f"Dataset size: {len(train_dataset)}")
+        print(f"Batch size: {batch_size}")
+        print(f"Number of batches per epoch: {len(train_data_loader)}")
 
-    data_loader_imagenet = DataLoader(imagenet_dataset, batch_size=batch_size, shuffle=False,
-                                      num_workers=4, pin_memory=True, drop_last=True, sampler=imagenet_sampler)
-    return train_data_loader, data_loader_imagenet
+    return train_data_loader
 
 
 def train(args):
@@ -108,8 +122,6 @@ def train(args):
     # Models for auxiliary loss computation
     eva_encoder = timm.create_model("hf_hub:timm/eva02_large_patch14_448.mim_m38m_ft_in1k", num_classes=0,
                                     pretrained=True).to(device).eval()
-    imagenet_encoder = torchvision.models.vit_b_16(pretrained=True).to(device).eval()
-    imagenet_encoder.head = torch.nn.Identity()
 
     if args.checkpoint != 'scratch':
         checkpoint = torch.load(args.checkpoint, map_location=device)
@@ -131,15 +143,13 @@ def train(args):
     else:
         raise ValueError
 
-    train_loader, data_loader_imagenet = make_dataloader(args, args.batch_size, rank, world_size)
-    data_loader_imagenet_cycle = cycle(data_loader_imagenet)
+    train_loader = make_dataloader(args, args.batch_size, rank, world_size)
 
     start_epoch = 0
     for epoch in range(start_epoch, args.epoch):
         total_loss = 0
         total_observer_clip = 0
         total_observer_eva = 0
-        total_observer_imagenet = 0
         global_step = 0
 
         for batch_idx, batch in enumerate(train_loader):
@@ -150,12 +160,11 @@ def train(args):
 
                 with torch.no_grad():
                     embed_tar = clip_encoder.encode_img(images)  # CLIP encoder
-                    images_ori, _ = next(data_loader_imagenet_cycle)
+                    images_ori = images.clone()
 
                     # Get target embeddings from auxiliary models
                     images_eva = F.interpolate(images, size=(448, 448), mode='bilinear')
                     embed_tar_eva = eva_encoder(images_eva)
-                    embed_tar_imagenet = imagenet_encoder(images)
 
                 noise = decoder(embed_tar)
                 noise = torch.clamp(noise, -args.eps, args.eps)
@@ -166,15 +175,12 @@ def train(args):
                 # Adversarial embeddings for auxiliary models
                 images_adv_eva = F.interpolate(images_adv, size=(448, 448), mode='bilinear')
                 embed_adv_eva = eva_encoder(images_adv_eva)
-                embed_adv_imagenet = imagenet_encoder(images_adv)
 
                 # Compute all three losses and observers
                 loss, observer_clip = select_criterion(args, criterion, embed_adv, embed_tar)
                 loss_eva, observer_eva = select_criterion(args, criterion, embed_adv_eva, embed_tar_eva)
-                loss_imagenet, observer_imagenet = select_criterion(args, criterion, embed_adv_imagenet,
-                                                                    embed_tar_imagenet)
 
-                total_loss_combined = loss + loss_eva + loss_imagenet  # Combine the three losses
+                total_loss_combined = loss + loss_eva  # Combine the three losses
 
                 scaler.scale(total_loss_combined).backward()
                 scaler.step(optimizer)
@@ -183,25 +189,30 @@ def train(args):
                 total_loss += total_loss_combined.item()
                 total_observer_clip += observer_clip.item()
                 total_observer_eva += observer_eva.item()
-                total_observer_imagenet += observer_imagenet.item()
                 global_step += 1
                 scheduler.step()
 
             if batch_idx % 100 == 0 and rank == 0:
-                avg_loss = total_loss / global_step
-                avg_observer_clip = total_observer_clip / global_step
-                avg_observer_eva = total_observer_eva / global_step
-                avg_observer_imagenet = total_observer_imagenet / global_step
-                current_lr = optimizer.param_groups[0]['lr']
+                if global_step > 0:
+                    avg_loss = total_loss / global_step
+                    avg_observer_clip = total_observer_clip / global_step
+                    avg_observer_eva = total_observer_eva / global_step
+                    current_lr = optimizer.param_groups[0]['lr']
 
-                # Print losses and observers for each model
-                print(
-                    f'Epoch {epoch}, Batch {batch_idx}, Loss: {avg_loss:.6f}, CLIP Similarity: {avg_observer_clip:.4f},'
-                    f'EVA Similarity: {avg_observer_eva:.4f}, ImageNet Similarity: {avg_observer_imagenet:.4f}, lr: {current_lr}')
+                    # Print losses and observers for each model
+                    print(
+                        f'Epoch {epoch}, Batch {batch_idx}, Loss: {avg_loss:.6f}, CLIP Similarity: {avg_observer_clip:.4f},'
+                        f'EVA Similarity: {avg_observer_eva:.4f}, lr: {current_lr}')
+                else:
+                    print(f"Epoch {epoch}, Batch {batch_idx}: global_step is 0, skipping log.")
 
-        avg_loss = total_loss / global_step
-        if rank == 0:
-            print(f"Epoch: {epoch}, Training Loss: {avg_loss}")
+        if global_step > 0:
+            avg_loss = total_loss / global_step
+            if rank == 0:
+                print(f"Epoch: {epoch}, Training Loss: {avg_loss}")
+        else:
+            if rank == 0:
+                print(f"Epoch: {epoch}, Warning: No batches processed in this epoch. Skipping loss calculation.")
 
         torch.save({
             'epoch': epoch,
@@ -224,7 +235,6 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--checkpoint", type=str, default='checkpoints/pre-trained.pt', help="path to checkpoint to load")
     parser.add_argument("--criterion", type=str, default='BiContrastiveLoss')
-    parser.add_argument("--imagenet", type=str)
     parser.add_argument("--cache_path", type=str, default='datasets')
     args = parser.parse_args()
 
